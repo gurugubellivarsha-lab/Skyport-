@@ -1,5 +1,5 @@
 
-name: Windows RDP and Minecraft Launcher
+name: Windows RDP + Tailscale + Minecraft
 
 on:
   workflow_dispatch:
@@ -8,26 +8,12 @@ permissions:
   contents: read
 
 jobs:
-  windows-rdp:
+  rdp:
     runs-on: windows-2025
     timeout-minutes: 350
 
     steps:
-      - name: Install Java for Minecraft
-        uses: actions/setup-java@v4
-        with:
-          distribution: microsoft
-          java-version: '21'
-
-      - name: Verify Java
-        shell: pwsh
-        run: |
-          java -version
-          if ($LASTEXITCODE -ne 0) {
-            throw "Java installation failed."
-          }
-
-      - name: Configure Temporary RDP
+      - name: Generate RDP Password and Configure Account
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -41,35 +27,43 @@ jobs:
           if (Get-LocalUser -Name "rdpuser" -ErrorAction SilentlyContinue) {
             Set-LocalUser -Name "rdpuser" -Password $secure
           } else {
-            New-LocalUser -Name "rdpuser" -Password $secure
+            New-LocalUser -Name "rdpuser" -Password $secure -PasswordNeverExpires
           }
 
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member "rdpuser" `
-            -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "rdpuser" -ErrorAction SilentlyContinue
 
           Set-ItemProperty `
-            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
             -Name fDenyTSConnections -Value 0
 
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-Service TermService -StartupType Automatic
           Start-Service TermService
 
-          Write-Host "::add-mask::$password"
-          "RDP_PASSWORD=$password" | Out-File $env:GITHUB_ENV -Append
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\mn" | Out-Null
+
+          @"
+          RDP Username: rdpuser
+          RDP Password: $password
+          RDP Port: 3389
+          "@ | Set-Content "$env:GITHUB_WORKSPACE\mn\mn.txt"
+
+          Write-Host "RDP account created and connection file generated."
 
       - name: Connect Tailscale
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
 
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: microsoft
+          java-version: '21'
+
       - name: Install Minecraft Launcher
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
           winget install `
             --id Mojang.MinecraftLauncher `
             --exact `
@@ -78,21 +72,20 @@ jobs:
             --accept-package-agreements `
             --disable-interactivity
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Minecraft Launcher installation failed."
-          }
+      - name: Save RDP Connection File
+        uses: actions/upload-artifact@v4
+        with:
+          name: mn
+          path: mn/mn.txt
+          retention-days: 1
 
-      - name: Show Connection Information
+      - name: Show Tailscale Address
         shell: pwsh
         run: |
           $ip = (tailscale ip -4 | Select-Object -First 1).Trim()
-
-          Write-Host "RDP address: ${ip}:3389"
+          Write-Host "RDP Address: ${ip}:3389"
           Write-Host "Username: rdpuser"
-          Write-Host "Password is generated for this run."
-          Write-Host "Minecraft Launcher installation attempted."
-          Write-Host "The runner is temporary."
-
+          Write-Host "Download the mn artifact for the password."
           while ($true) {
             Start-Sleep -Seconds 30
           }
