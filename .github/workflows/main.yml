@@ -1,5 +1,5 @@
 
-name: Windows RDP NRB + Minecraft
+name: Windows RDP NRB Minecraft
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Install Java
+      - name: Install Java for Minecraft
         uses: actions/setup-java@v4
         with:
           distribution: microsoft
@@ -30,19 +30,32 @@ jobs:
 
       - name: Configure RDP Account
         shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $username = "NRB"
-          $password = "NRB"
-          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Add RDP_PASSWORD in GitHub Secrets."
+          }
 
-          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-            Set-LocalUser -Name $username -Password $secure
-          } else {
+          if ($env:RDP_PASSWORD.Length -lt 12) {
+            throw "RDP_PASSWORD must be at least 12 characters."
+          }
+
+          $username = "NRB"
+          $secure = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          $user = Get-LocalUser -Name $username `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $user) {
             New-LocalUser -Name $username `
               -Password $secure `
               -PasswordNeverExpires
+          } else {
+            Set-LocalUser -Name $username -Password $secure
           }
 
           Add-LocalGroupMember `
@@ -83,18 +96,17 @@ jobs:
             throw "Minecraft Launcher installation failed."
           }
 
-      - name: Show RDP Connection
+      - name: Show Connection Details
         shell: pwsh
         run: |
           $ip = (tailscale ip -4 | Select-Object -First 1).Trim()
 
-          Write-Host "================================"
-          Write-Host "RDP ADDRESS: ${ip}:3389"
-          Write-Host "USERNAME: NRB"
-          Write-Host "PASSWORD: NRB"
-          Write-Host "================================"
-          Write-Host "Keep this workflow running."
+          Write-Host "RDP address: ${ip}:3389"
+          Write-Host "Username: NRB"
+          Write-Host "Use your RDP_PASSWORD GitHub Secret."
+          Write-Host "Keep the workflow running."
 
           while ($true) {
             Start-Sleep -Seconds 30
           }
+          
