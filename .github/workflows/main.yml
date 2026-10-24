@@ -1,112 +1,93 @@
 
-name: Windows RDP NRB Minecraft
+name: Windows Workspace with Tailscale
 
 on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
+  id-token: write
 
 jobs:
-  windows-rdp:
-    runs-on: windows-2025
+  setup:
+    runs-on: windows-latest
     timeout-minutes: 350
 
     steps:
-      - name: Install Java for Minecraft
-        uses: actions/setup-java@v4
+      - name: Restore previous workspace
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
         with:
-          distribution: microsoft
-          java-version: '21'
+          workflow: windows-workspace.yml
+          name: windows-workspace
+          path: restored
+          if_no_artifact_found: warn
 
-      - name: Verify Java
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          java -version
-          if ($LASTEXITCODE -ne 0) {
-            throw "Java installation failed."
-          }
-
-      - name: Configure RDP Account
-        shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "Add RDP_PASSWORD in GitHub Secrets."
-          }
-
-          if ($env:RDP_PASSWORD.Length -lt 12) {
-            throw "RDP_PASSWORD must be at least 12 characters."
-          }
-
-          $username = "NRB"
-          $secure = ConvertTo-SecureString `
-            $env:RDP_PASSWORD -AsPlainText -Force
-
-          $user = Get-LocalUser -Name $username `
-            -ErrorAction SilentlyContinue
-
-          if ($null -eq $user) {
-            New-LocalUser -Name $username `
-              -Password $secure `
-              -PasswordNeverExpires
-          } else {
-            Set-LocalUser -Name $username -Password $secure
-          }
-
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member $username `
-            -ErrorAction SilentlyContinue
-
-          Set-ItemProperty `
-            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-            -Name fDenyTSConnections -Value 0
-
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-Service TermService -StartupType Automatic
-          Start-Service TermService
-
-          Write-Host "RDP account configured."
-          Write-Host "Username: NRB"
-
-      - name: Connect Tailscale
+      - name: Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
-          authkey: ${{ secrets.TS_AUTHKEY }}
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
 
-      - name: Install Minecraft Launcher
+      - name: Install Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install VS Code
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
-          winget install `
-            --id Mojang.MinecraftLauncher `
-            --exact `
-            --silent `
-            --accept-source-agreements `
+          winget install --id Microsoft.VisualStudioCode `
+            --exact --silent `
             --accept-package-agreements `
-            --disable-interactivity
+            --accept-source-agreements
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Minecraft Launcher installation failed."
-          }
-
-      - name: Show Connection Details
+      - name: Prepare and restore workspace
         shell: pwsh
         run: |
-          $ip = (tailscale ip -4 | Select-Object -First 1).Trim()
+          New-Item -ItemType Directory -Force `
+            workspace, workspace/Minecraft, workspace/Projects |
+            Out-Null
 
-          Write-Host "RDP address: ${ip}:3389"
-          Write-Host "Username: NRB"
-          Write-Host "Use your RDP_PASSWORD GitHub Secret."
-          Write-Host "Keep the workflow running."
-
-          while ($true) {
-            Start-Sleep -Seconds 30
+          if (Test-Path restored) {
+            Copy-Item restored/* workspace/ -Recurse -Force
           }
+
+          java --version
+          javac --version
+
+      - name: Check graphics hardware
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name, DriverVersion |
+            Format-List
+
+          Write-Host "OpenGL support depends on the graphics driver."
+
+      - name: Check RDP secrets
+        shell: pwsh
+        env:
+          RDP_USER: ${{ secrets.RDP_USER }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_USER) -or
+              [string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            Write-Host "RDP credentials are not configured."
+          } elseif ($env:RDP_PASSWORD.Length -lt 16) {
+            throw "Use an RDP password with at least 16 characters."
+          } else {
+            Write-Host "Credentials validated."
+          }
+
+      - name: Save workspace backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-workspace
+          path: workspace/
+          retention-days: 30
+          if-no-files-found: error
           
