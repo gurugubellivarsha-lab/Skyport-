@@ -1,4 +1,4 @@
-name: Skyport Windows Workspace
+name: Windows RDP NRB Minecraft
 
 on:
   workflow_dispatch:
@@ -7,57 +7,171 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
-  windows-workspace:
-    name: Configure Temporary Windows Workspace
+  windows-rdp:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 350
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
 
+      - name: Find latest successful backup run
+        id: previous
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $repo = $env:GITHUB_REPOSITORY
+          $uri = "https://api.github.com/repos/$repo/actions/runs?per_page=100"
+          $response = Invoke-RestMethod -Uri $uri -Headers $headers
+          $currentId = [long]$env:GITHUB_RUN_ID
+          $branch = $env:GITHUB_REF_NAME
+          $previousRun = $response.workflow_runs |
+            Where-Object {
+              $_.id -ne $currentId -and
+              $_.name -eq "Windows RDP NRB Minecraft" -and
+              $_.conclusion -eq "success" -and
+              $_.head_branch -eq $branch
+            } |
+            Sort-Object created_at -Descending |
+            Select-Object -First 1
+
+          if ($null -ne $previousRun) {
+            "run_id=$($previousRun.id)" >> $env:GITHUB_OUTPUT
+            Write-Host "Previous successful run found: $($previousRun.id)"
+          } else {
+            "run_id=" >> $env:GITHUB_OUTPUT
+            Write-Host "No previous successful run found; starting with an empty workspace."
+          }
+
+      - name: Download previous workspace backup
+        if: steps.previous.outputs.run_id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v5
+        with:
+          name: nrb-workspace-backup
+          path: restored-backup
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.previous.outputs.run_id }}
+
+      - name: Restore workspace files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $base = Join-Path $env:GITHUB_WORKSPACE "RDP-Workspace"
+          New-Item -ItemType Directory -Force -Path $base, "$base\Projects", "$base\Minecraft", "$base\Backups" | Out-Null
+
+          $restorePath = Join-Path $env:GITHUB_WORKSPACE "restored-backup"
+          if (Test-Path $restorePath) {
+            Copy-Item -Path "$restorePath\*" -Destination $base -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "Previous workspace backup restored where available."
+          } else {
+            Write-Host "No previous backup was downloaded; created a fresh workspace."
+          }
+
       - name: Install Java 21
         uses: actions/setup-java@v5
         with:
-          distribution: temurin
+          distribution: microsoft
           java-version: '21'
 
-      - name: Verify Windows and Java
+      - name: Verify Java and workspace
         shell: pwsh
         run: |
-          Write-Host "Windows runner is working."
-          Write-Host "Computer: $env:COMPUTERNAME"
+          $ErrorActionPreference = "Stop"
           java -version
+          if ($LASTEXITCODE -ne 0) { throw "Java installation failed." }
+          Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE "RDP-Workspace") -Force
 
-      - name: Create workspace
+      - name: Configure temporary RDP account
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Add RDP_PASSWORD in GitHub repository Secrets."
+          }
+          if ($env:RDP_PASSWORD.Length -lt 12) {
+            throw "RDP_PASSWORD must be at least 12 characters."
+          }
+
+          $username = "NRB"
+          $secure = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+          if ($null -eq $user) {
+            New-LocalUser -Name $username -Password $secure -PasswordNeverExpires | Out-Null
+          } else {
+            Set-LocalUser -Name $username -Password $secure
+          }
+          Enable-LocalUser -Name $username
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
+          Write-Host "Temporary RDP account configured: $username"
+
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+
+      - name: Show Tailscale connection details
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          $ip = (tailscale ip -4 | Select-Object -First 1).Trim()
+          if ([string]::IsNullOrWhiteSpace($ip)) { throw "Tailscale did not return an IPv4 address." }
+          Write-Host "RDP address: ${ip}:3389"
+          Write-Host "Username: NRB"
+          Write-Host "Password: use the RDP_PASSWORD secret; it is not printed."
+
+      - name: Attempt Minecraft Launcher installation
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          if (Get-Command winget -ErrorAction SilentlyContinue) {
+            winget install --id Mojang.MinecraftLauncher --exact --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Launcher installation failed or is unavailable on this runner image." }
+          } else {
+            Write-Warning "winget is not available on this runner image; skipping launcher installation."
+          }
+
+      - name: Keep session alive and back up workspace on exit
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
           $base = Join-Path $env:GITHUB_WORKSPACE "RDP-Workspace"
-
-          New-Item -ItemType Directory -Force -Path `
-            "$base\Projects", `
-            "$base\Minecraft", `
-            "$base\Backups" | Out-Null
-
+          New-Item -ItemType Directory -Force -Path $base, "$base\Projects", "$base\Minecraft", "$base\Backups" | Out-Null
           @"
-          Skyport Windows Workspace
+          Windows RDP NRB Minecraft workspace
           Java: 21
-          Projects: $base\Projects
-          Minecraft: $base\Minecraft
-          "@ | Set-Content "$base\README.txt"
+          This workspace is restored from the latest successful workflow artifact when available.
+          GitHub-hosted Windows runners are temporary; installed programs and system settings do not persist between runs.
+          "@ | Set-Content (Join-Path $base "README.txt")
 
-      - name: Check graphics adapter
-        shell: pwsh
-        run: |
-          Get-CimInstance Win32_VideoController |
-            Select-Object Name, DriverVersion
+          Write-Host "Keeping the temporary session alive for up to 340 minutes."
+          $endAt = (Get-Date).AddMinutes(340)
+          while ((Get-Date) -lt $endAt) { Start-Sleep -Seconds 30 }
+          Write-Host "Session window ended; the following step will upload the workspace backup."
 
-      - name: Upload workspace artifact
+      - name: Upload workspace backup
+        if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: skyport-workspace-${{ github.run_number }}
+          name: nrb-workspace-backup
           path: RDP-Workspace/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 7
+          
