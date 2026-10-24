@@ -1,37 +1,29 @@
-
-name: Windows Workspace with Tailscale
+name: Windows RDP Setup and Backup
 
 on:
   workflow_dispatch:
 
 permissions:
-  actions: read
   contents: read
-  id-token: write
+  actions: read
 
 jobs:
   setup:
-    runs-on: windows-latest
-    timeout-minutes: 350
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 30
 
     steps:
-      - name: Restore previous workspace
-        uses: dawidd6/action-download-artifact@v6
-        continue-on-error: true
-        with:
-          workflow: windows-workspace.yml
-          name: windows-workspace
-          path: restored
-          if_no_artifact_found: warn
+      - name: Verify Windows and Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Get-ComputerInfo | Select-Object WindowsProductName
+          if (-not (Get-Command tailscale -ErrorAction SilentlyContinue)) {
+            throw "Install Tailscale on this VPS first."
+          }
+          tailscale status
 
-      - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
-        with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          audience: ${{ secrets.TS_AUDIENCE }}
-          tags: tag:ci
-
-      - name: Install Java JDK
+      - name: Configure Java JDK
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -45,49 +37,75 @@ jobs:
             --accept-package-agreements `
             --accept-source-agreements
 
-      - name: Prepare and restore workspace
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force `
-            workspace, workspace/Minecraft, workspace/Projects |
-            Out-Null
-
-          if (Test-Path restored) {
-            Copy-Item restored/* workspace/ -Recurse -Force
-          }
-
-          java --version
-          javac --version
-
-      - name: Check graphics hardware
-        shell: pwsh
-        run: |
-          Get-CimInstance Win32_VideoController |
-            Select-Object Name, DriverVersion |
-            Format-List
-
-          Write-Host "OpenGL support depends on the graphics driver."
-
-      - name: Check RDP secrets
+      - name: Configure authorized RDP account
         shell: pwsh
         env:
           RDP_USER: ${{ secrets.RDP_USER }}
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
+          $ErrorActionPreference = "Stop"
+
           if ([string]::IsNullOrWhiteSpace($env:RDP_USER) -or
               [string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            Write-Host "RDP credentials are not configured."
-          } elseif ($env:RDP_PASSWORD.Length -lt 16) {
-            throw "Use an RDP password with at least 16 characters."
-          } else {
-            Write-Host "Credentials validated."
+            throw "Configure RDP_USER and RDP_PASSWORD secrets."
           }
+
+          if ($env:RDP_PASSWORD.Length -lt 16) {
+            throw "Use a password of at least 16 characters."
+          }
+
+          $secure = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          $account = Get-LocalUser -Name $env:RDP_USER `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $account) {
+            New-LocalUser -Name $env:RDP_USER `
+              -Password $secure `
+              -Description "Authorized RDP account"
+          } else {
+            Set-LocalUser -Name $env:RDP_USER `
+              -Password $secure
+          }
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $env:RDP_USER `
+            -ErrorAction SilentlyContinue
+
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name fDenyTSConnections -Value 0
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Write-Host "RDP account configured."
+
+      - name: Check Java and graphics
+        shell: pwsh
+        run: |
+          java --version
+          javac --version
+
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name, DriverVersion |
+            Format-Table -AutoSize
+
+          Write-Host "OpenGL capability depends on the installed GPU driver."
+
+      - name: Prepare Minecraft workspace
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force `
+            C:\RDP-Workspace\Minecraft, `
+            C:\RDP-Workspace\Projects | Out-Null
 
       - name: Save workspace backup
         uses: actions/upload-artifact@v4
         with:
           name: windows-workspace
-          path: workspace/
+          path: C:\RDP-Workspace
           retention-days: 30
           if-no-files-found: error
           
