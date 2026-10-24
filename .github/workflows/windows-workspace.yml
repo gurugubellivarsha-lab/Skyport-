@@ -8,39 +8,16 @@ on:
 
 permissions:
   contents: read
-  actions: read
 
 jobs:
   windows-workspace:
-    name: Configure Windows VPS
-    runs-on: [self-hosted, Windows, X64]
+    name: Configure Temporary Windows Workspace
+    runs-on: windows-latest
     timeout-minutes: 30
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Verify Windows runner
-        shell: pwsh
-        run: |
-          Write-Host "Runner: $env:COMPUTERNAME"
-          Write-Host "User: $env:USERNAME"
-          Get-ComputerInfo |
-            Select-Object WindowsProductName, WindowsVersion
-          Write-Host "Persistent workspace is on this Windows machine."
-
-      - name: Check required secrets
-        shell: pwsh
-        env:
-          RDP_USER: ${{ secrets.RDP_USER }}
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:RDP_USER)) {
-            throw "Add RDP_USER in repository Actions secrets."
-          }
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "Add RDP_PASSWORD in repository Actions secrets."
-          }
 
       - name: Install Java 21
         uses: actions/setup-java@v4
@@ -48,79 +25,14 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Verify Java
+      - name: Verify Windows and Java
         shell: pwsh
         run: |
+          Write-Host "Windows runner is working."
+          Write-Host "Computer: $env:COMPUTERNAME"
           java -version
-          javac -version
 
-      - name: Install VS Code
-        shell: pwsh
-        run: |
-          if (Get-Command code -ErrorAction SilentlyContinue) {
-            Write-Host "VS Code is already installed."
-          } elseif (Get-Command winget -ErrorAction SilentlyContinue) {
-            winget install --id Microsoft.VisualStudioCode `
-              --exact --silent `
-              --accept-package-agreements `
-              --accept-source-agreements
-          } else {
-            Write-Warning "winget is unavailable. Install VS Code manually on the VPS."
-          }
-
-      - name: Configure RDP account and Windows settings
-        shell: pwsh
-        env:
-          RDP_USER: ${{ secrets.RDP_USER }}
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $securePassword = ConvertTo-SecureString `
-            $env:RDP_PASSWORD -AsPlainText -Force
-
-          $account = Get-LocalUser -Name $env:RDP_USER `
-            -ErrorAction SilentlyContinue
-
-          if ($null -eq $account) {
-            New-LocalUser -Name $env:RDP_USER `
-              -Password $securePassword `
-              -Description "Skyport RDP account"
-          } else {
-            Set-LocalUser -Name $env:RDP_USER `
-              -Password $securePassword
-          }
-
-          Enable-LocalUser -Name $env:RDP_USER
-
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member $env:RDP_USER `
-            -ErrorAction SilentlyContinue
-
-          Set-ItemProperty `
-            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" -Value 0
-
-          Enable-NetFirewallRule `
-            -DisplayGroup "Remote Desktop"
-
-          Write-Host "RDP configured. Use Tailscale for private access."
-
-      - name: Check Tailscale
-        shell: pwsh
-        run: |
-          $ts = Get-Command tailscale -ErrorAction SilentlyContinue
-
-          if ($null -eq $ts) {
-            Write-Warning "Tailscale is not installed or not on PATH."
-            Write-Warning "Install it on the VPS and sign in to your tailnet."
-          } else {
-            tailscale status
-            tailscale ip -4
-          }
-
-      - name: Create persistent workspace
+      - name: Create workspace
         shell: pwsh
         run: |
           $base = "C:\RDP-Workspace"
@@ -131,14 +43,17 @@ jobs:
             "$base\Backups" | Out-Null
 
           @"
-          Skyport persistent workspace
+          Skyport Windows Workspace
           Java: 21
           Projects: $base\Projects
           Minecraft: $base\Minecraft
-          Backups: $base\Backups
+
+          Note: This runner is temporary.
+          Download the workflow artifact to keep workspace files.
           "@ | Set-Content "$base\README.txt"
 
-          Write-Host "Workspace location: $base"
+          Copy-Item "$base\README.txt" `
+            "$env:GITHUB_WORKSPACE\SKYPORT-WORKSPACE.txt"
 
       - name: Check graphics adapter
         shell: pwsh
@@ -146,10 +61,12 @@ jobs:
           Get-CimInstance Win32_VideoController |
             Select-Object Name, DriverVersion
 
-      - name: Upload workspace snapshot
+      - name: Save workspace artifact
         uses: actions/upload-artifact@v4
         with:
           name: skyport-workspace-${{ github.run_number }}
-          path: C:\RDP-Workspace\README.txt
+          path: |
+            C:\RDP-Workspace
+            SKYPORT-WORKSPACE.txt
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 7
