@@ -1,0 +1,129 @@
+
+name: Windows RDP with Tailscale
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  rdp:
+    runs-on: windows-2025
+    timeout-minutes: 350
+
+    steps:
+      - name: Validate secrets
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Add the RDP_PASSWORD secret."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "Add the TS_AUTHKEY secret."
+          }
+
+      # Restore the artifact from your previous workflow run.
+      - name: Restore previous workspace backup
+        id: restore
+        uses: actions/download-artifact@v5
+        continue-on-error: true
+        with:
+          name: RDP-Workspace
+          path: RDP-Workspace/
+          repository: ${{ github.repository }}
+          run-id: 40148480212
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check restored workspace
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory `
+            -Path "$env:GITHUB_WORKSPACE\RDP-Workspace" `
+            -Force | Out-Null
+
+          Write-Host "Restored workspace files:"
+          Get-ChildItem `
+            "$env:GITHUB_WORKSPACE\RDP-Workspace" `
+            -Recurse
+
+      - name: Configure RDP
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $password = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (Get-LocalUser -Name "NRB" `
+              -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name "NRB" -Password $password
+          } else {
+            New-LocalUser -Name "NRB" `
+              -Password $password `
+              -PasswordNeverExpires | Out-Null
+          }
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "NRB" `
+            -ErrorAction SilentlyContinue
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name fDenyTSConnections -Value 0
+
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop"
+
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          timeout: 3m
+
+      - name: Show connection details
+        shell: pwsh
+        run: |
+          Write-Host "Tailscale IP:"
+          tailscale ip -4
+          Write-Host "RDP username: NRB"
+
+      - name: Prepare workspace
+        shell: pwsh
+        run: |
+          $folder = "$env:GITHUB_WORKSPACE\RDP-Workspace"
+          New-Item -ItemType Directory -Path $folder -Force |
+            Out-Null
+
+          $readme = Join-Path $folder "README.txt"
+          if (!(Test-Path $readme)) {
+            "Save files here for artifact backup." |
+              Set-Content $readme
+          }
+
+      - name: Keep session available
+        shell: pwsh
+        run: |
+          for ($i = 1; $i -le 330; $i++) {
+            Start-Sleep -Seconds 60
+            if ($i % 5 -eq 0) {
+              Write-Host "Session running: $i minutes"
+            }
+          }
+
+      - name: Save workspace backup
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: RDP-Workspace
+          path: RDP-Workspace/
+          if-no-files-found: warn
+          retention-days: 7
+          
